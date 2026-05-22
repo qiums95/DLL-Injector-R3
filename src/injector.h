@@ -1,10 +1,10 @@
 #pragma once
 
 #include <Windows.h>
-#include <iostream>
-#include <fstream>
 #include <TlHelp32.h>
 #include <stdio.h>
+#include <cstring>
+#include <fstream>
 #include <string>
 
 using f_LoadLibraryA = HINSTANCE(WINAPI*)(const char* lpLibFilename);
@@ -13,26 +13,47 @@ using f_DLL_ENTRY_POINT = BOOL(WINAPI*)(void* hDll, DWORD dwReason, void* pReser
 
 #ifdef _WIN64
 using f_RtlAddFunctionTable = BOOL(WINAPIV*)(PRUNTIME_FUNCTION FunctionTable, DWORD EntryCount, DWORD64 BaseAddress);
+using f_RtlDeleteFunctionTable = BOOL(WINAPIV*)(PRUNTIME_FUNCTION FunctionTable);
 #endif
 
-struct MANUAL_MAPPING_DATA
-{
-	f_LoadLibraryA pLoadLibraryA;
-	f_GetProcAddress pGetProcAddress;
+struct UNLOAD_DATA {
+    DWORD       dwSizeOfImage;
+    BYTE*       pBase;
+    HINSTANCE   hMod;
+    DWORD       dwEntryPointRVA;
+    DWORD       dwTlsDirVA;
+    DWORD       dwTlsDirSize;
 #ifdef _WIN64
-	f_RtlAddFunctionTable pRtlAddFunctionTable;
+    DWORD       dwExceptionDirVA;
+    DWORD       dwExceptionDirSize;
+    f_RtlDeleteFunctionTable pRtlDeleteFunctionTable;
 #endif
-	BYTE* pbase;
-	HINSTANCE hMod;
-	DWORD fdwReasonParam;
-	LPVOID reservedParam;
-	BOOL SEHSupport;
 };
 
+struct MANUAL_MAPPING_DATA {
+    f_LoadLibraryA      pLoadLibraryA;
+    f_GetProcAddress    pGetProcAddress;
+#ifdef _WIN64
+    f_RtlAddFunctionTable pRtlAddFunctionTable;
+#endif
+    BYTE*       pBase;
+    HINSTANCE   hMod;
+    DWORD       dwReasonParam;
+    LPVOID      pReservedParam;
+    BOOL        bSEHSupport;
+};
 
-bool InjectFromFile(DWORD PID, const wchar_t* dllPath);
-bool InjectFromMemory(DWORD PID, BYTE* pSrcData, SIZE_T FileSize);
+bool InjectFromFile(DWORD PID, const wchar_t* dllPath,
+    UNLOAD_DATA* pUnloadData = nullptr);
+bool InjectFromMemory(DWORD PID, BYTE* pSrcData, SIZE_T FileSize,
+    UNLOAD_DATA* pUnloadData = nullptr);
+bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize,
+    UNLOAD_DATA* pUnloadData,
+    bool ClearHeader = true, bool ClearNonNeededSections = true,
+    bool AdjustProtections = true, bool SEHExceptionSupport = true,
+    DWORD fdwReason = DLL_PROCESS_ATTACH, LPVOID lpReserved = 0);
 
-//Note: Exception support only x64 with build params /EHa or /EHc
-bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader = true, bool ClearNonNeededSections = true, bool AdjustProtections = true, bool SEHExceptionSupport = true, DWORD fdwReason = DLL_PROCESS_ATTACH, LPVOID lpReserved = 0);
+bool UnloadDll(DWORD PID, const UNLOAD_DATA& unloadData);
+
 void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData);
+void __stdcall UnloadShellcode(UNLOAD_DATA* pData);

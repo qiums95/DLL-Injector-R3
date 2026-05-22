@@ -25,7 +25,7 @@ bool IsCorrectTargetArchitecture(HANDLE hProc) {
 	return (bTarget == bHost);
 }
 
-bool InjectFromMemory(DWORD PID, BYTE* pSrcData, SIZE_T FileSize) {
+bool InjectFromMemory(DWORD PID, BYTE* pSrcData, SIZE_T FileSize, UNLOAD_DATA* pUnloadData) {
 	if (!pSrcData || FileSize == 0) {
 		LOG("Invalid memory data.\n");
 		return false;
@@ -54,7 +54,7 @@ bool InjectFromMemory(DWORD PID, BYTE* pSrcData, SIZE_T FileSize) {
 	}
 
 	LOG("Mapping DLL from memory...\n");
-	if (!ManualMapDll(hProc, PID, pSrcData, FileSize, true, true, true, true, DLL_PROCESS_ATTACH, 0)) {
+	if (!ManualMapDll(hProc, PID, pSrcData, FileSize, pUnloadData, true, true, true, true, DLL_PROCESS_ATTACH, 0)) {
 		LOG("Error while mapping.\n");
 		CloseHandle(hProc);
 		return false;
@@ -65,7 +65,7 @@ bool InjectFromMemory(DWORD PID, BYTE* pSrcData, SIZE_T FileSize) {
 	return true;
 }
 
-bool InjectFromFile(DWORD PID, const wchar_t* dllPath) {
+bool InjectFromFile(DWORD PID, const wchar_t* dllPath, UNLOAD_DATA* pUnloadData) {
 	if (GetFileAttributesW(dllPath) == INVALID_FILE_ATTRIBUTES) {
 		LOG("Dll file doesn't exist\n");
 		return false;
@@ -84,7 +84,7 @@ bool InjectFromFile(DWORD PID, const wchar_t* dllPath) {
 		return false;
 	}
 
-	BYTE* pSrcData = new BYTE[(UINT_PTR)FileSize];
+	BYTE* pSrcData = new(std::nothrow) BYTE[(SIZE_T)FileSize];
 	if (!pSrcData) {
 		LOG("Can't allocate memory for dll file.\n");
 		File.close();
@@ -95,13 +95,13 @@ bool InjectFromFile(DWORD PID, const wchar_t* dllPath) {
 	File.read((char*)(pSrcData), FileSize);
 	File.close();
 
-	bool bSuccess = InjectFromMemory(PID, pSrcData, (SIZE_T)FileSize);
+	bool bSuccess = InjectFromMemory(PID, pSrcData, (SIZE_T)FileSize, pUnloadData);
 	delete[] pSrcData;
 
 	return bSuccess;
 }
 
-bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
+bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, UNLOAD_DATA* pUnloadData, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
 	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
 	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
 	IMAGE_FILE_HEADER* pOldFileHeader = nullptr;
@@ -140,11 +140,23 @@ bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool
 #else 
 	SEHExceptionSupport = false;
 #endif
-	data.pbase = pTargetBase;
-	data.fdwReasonParam = fdwReason;
-	data.reservedParam = lpReserved;
-	data.SEHSupport = SEHExceptionSupport;
+	data.pBase = pTargetBase;
+	data.dwReasonParam = fdwReason;
+	data.pReservedParam = lpReserved;
+	data.bSEHSupport = SEHExceptionSupport;
 
+	if (pUnloadData) {
+		pUnloadData->dwSizeOfImage = pOldOptHeader->SizeOfImage;
+		pUnloadData->pBase = pTargetBase;
+		pUnloadData->dwEntryPointRVA = pOldOptHeader->AddressOfEntryPoint;
+		pUnloadData->dwTlsDirVA = pOldOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+		pUnloadData->dwTlsDirSize = pOldOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+#ifdef _WIN64
+		pUnloadData->dwExceptionDirVA = pOldOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+		pUnloadData->dwExceptionDirSize = pOldOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+		pUnloadData->pRtlDeleteFunctionTable = (f_RtlDeleteFunctionTable)RtlDeleteFunctionTable;
+#endif
+	}
 
 	//File header
 	if (!WriteProcessMemory(hProc, pTargetBase, pSrcData, 0x1000, nullptr)) { //only first 0x1000 bytes for the header
@@ -335,9 +347,35 @@ bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool
 	ctx.Eip = (DWORD)pStub;
 #endif
 
-	WriteProcessMemory(hProc, pStub, Stub, sizeof(Stub), nullptr);
-	SetThreadContext(hThread, &ctx);
-	ResumeThread(hThread);
+	if (!WriteProcessMemory(hProc, pStub, Stub, sizeof(Stub), nullptr)) {
+		LOG("WriteProcessMemory (Stub) failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		ResumeThread(hThread);
+		CloseHandle(hThread);
+		return false;
+	}
+	if (!SetThreadContext(hThread, &ctx)) {
+		LOG("SetThreadContext failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		ResumeThread(hThread);
+		CloseHandle(hThread);
+		return false;
+	}
+	if (ResumeThread(hThread) == (DWORD)-1) {
+		LOG("ResumeThread (hijack) failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		CloseHandle(hThread);
+		return false;
+	}
 
 	LOG("Thread Hijacked successfully! Target TID: %d, Waiting for C++ payload execution...\n", dwTID);
 
@@ -359,16 +397,6 @@ bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool
 		ReadProcessMemory(hProc, MappingDataAlloc, &data_checked, sizeof(data_checked), nullptr);
 		hCheck = data_checked.hMod;
 
-		if (hCheck == (HINSTANCE)0x404040) {
-			LOG("Wrong mapping ptr\n");
-			VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-			VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
-			VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
-			VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
-			CloseHandle(hThread);
-			return false;
-		}
-
 		Sleep(10);
 	}
 
@@ -385,13 +413,13 @@ bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool
 		ResumeThread(hThread);
 
 #ifdef _WIN64
-		if (checkCtx.Rip < (DWORD64)pStub || checkCtx.Rip >= ((DWORD64)pStub + 0x1000)) {
-			break;
-		}
+		bool inStub = (checkCtx.Rip >= (DWORD64)pStub && checkCtx.Rip < (DWORD64)pStub + 0x1000);
+		bool inShellcode = (checkCtx.Rip >= (DWORD64)pShellcode && checkCtx.Rip < (DWORD64)pShellcode + 0x1000);
+		if (!inStub && !inShellcode) break;
 #else
-		if (checkCtx.Eip < (DWORD)pStub || checkCtx.Eip >= ((DWORD)pStub + 0x1000)) {
-			break;
-		}
+		bool inStub = (checkCtx.Eip >= (DWORD)pStub && checkCtx.Eip < (DWORD)pStub + 0x1000);
+		bool inShellcode = (checkCtx.Eip >= (DWORD)pShellcode && checkCtx.Eip < (DWORD)pShellcode + 0x1000);
+		if (!inStub && !inShellcode) break;
 #endif
 		Sleep(1);
 	}
@@ -480,6 +508,260 @@ bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool
 	return true;
 }
 
+bool UnloadDll(DWORD PID, const UNLOAD_DATA& unloadData) {
+	TOKEN_PRIVILEGES priv = { 0 };
+	HANDLE hToken = NULL;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+		priv.PrivilegeCount = 1;
+		priv.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+		if (LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &priv.Privileges[0].Luid))
+			AdjustTokenPrivileges(hToken, FALSE, &priv, 0, NULL, NULL);
+		CloseHandle(hToken);
+	}
+
+	HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, PID);
+	if (!hProc) {
+		LOG("Unload: OpenProcess failed: 0x%X\n", GetLastError());
+		return false;
+	}
+
+	BYTE* pDataCopy = reinterpret_cast<BYTE*>(VirtualAllocEx(hProc, nullptr, sizeof(UNLOAD_DATA), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	if (!pDataCopy) {
+		LOG("Unload: data allocation failed (ex) 0x%X\n", GetLastError());
+		CloseHandle(hProc);
+		return false;
+	}
+
+	if (!WriteProcessMemory(hProc, pDataCopy, &unloadData, sizeof(UNLOAD_DATA), nullptr)) {
+		LOG("Unload: Can't write data 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		CloseHandle(hProc);
+		return false;
+	}
+
+	void* pShellcode = VirtualAllocEx(hProc, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!pShellcode) {
+		LOG("Unload: shellcode allocation failed (ex) 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		CloseHandle(hProc);
+		return false;
+	}
+
+	if (!WriteProcessMemory(hProc, pShellcode, UnloadShellcode, 0x1000, nullptr)) {
+		LOG("Unload: Can't write shellcode 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		CloseHandle(hProc);
+		return false;
+	}
+
+	void* pStub = VirtualAllocEx(hProc, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!pStub) {
+		LOG("Unload: stub allocation failed (ex) 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		CloseHandle(hProc);
+		return false;
+	}
+
+	LOG("Unload data at %p\n", pDataCopy);
+	LOG("Unload shellcode at %p\n", pShellcode);
+	LOG("Unload stub at %p\n", pStub);
+	LOG("Unload data allocated\n");
+
+	HANDLE hThread = NULL;
+	DWORD dwTID = 0;
+	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (hSnap != INVALID_HANDLE_VALUE) {
+		THREADENTRY32 te;
+		te.dwSize = sizeof(te);
+		if (Thread32First(hSnap, &te)) {
+			do {
+				if (te.th32OwnerProcessID == PID && te.th32ThreadID != GetCurrentThreadId()) {
+					hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+					if (hThread) {
+						dwTID = te.th32ThreadID;
+						break;
+					}
+				}
+			} while (Thread32Next(hSnap, &te));
+		}
+		CloseHandle(hSnap);
+	}
+
+	if (!hThread) {
+		LOG("Unload: No suitable thread found\n");
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		CloseHandle(hProc);
+		return false;
+	}
+
+	if (SuspendThread(hThread) == (DWORD)-1) {
+		LOG("Unload: SuspendThread failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		CloseHandle(hThread);
+		CloseHandle(hProc);
+		return false;
+	}
+
+	CONTEXT ctx = { 0 };
+	ctx.ContextFlags = CONTEXT_CONTROL;
+	if (!GetThreadContext(hThread, &ctx)) {
+		LOG("Unload: GetThreadContext failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		ResumeThread(hThread);
+		CloseHandle(hThread);
+		CloseHandle(hProc);
+		return false;
+	}
+
+#ifdef _WIN64
+	BYTE Stub[] = {
+		0x48, 0x83, 0xEC, 0x08,
+		0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00,
+		0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00,
+		0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+		0x9C,
+		0x55, 0x48, 0x8B, 0xEC,
+		0x48, 0x83, 0xE4, 0xF0,
+		0x48, 0x83, 0xEC, 0x20,
+		0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0xFF, 0xD0,
+		0x48, 0x8B, 0xE5, 0x5D,
+		0x9D,
+		0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58,
+		0xC3
+	};
+
+	DWORD64 oldRip = ctx.Rip;
+	DWORD loRip = (DWORD)(oldRip & 0xFFFFFFFF);
+	DWORD hiRip = (DWORD)((oldRip >> 32) & 0xFFFFFFFF);
+
+	memcpy(Stub + 7, &loRip, sizeof(DWORD));
+	memcpy(Stub + 15, &hiRip, sizeof(DWORD));
+	memcpy(Stub + 45, &pDataCopy, sizeof(DWORD64));
+	memcpy(Stub + 55, &pShellcode, sizeof(DWORD64));
+
+	ctx.Rip = (DWORD64)pStub;
+#else
+	BYTE Stub[] = {
+		0x83, 0xEC, 0x04,
+		0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00,
+		0x50, 0x51, 0x52,
+		0x9C,
+		0x68, 0x00, 0x00, 0x00, 0x00,
+		0xB8, 0x00, 0x00, 0x00, 0x00,
+		0xFF, 0xD0,
+		0x9D,
+		0x5A, 0x59, 0x58,
+		0xC3
+	};
+
+	DWORD oldEip = ctx.Eip;
+	memcpy(Stub + 6, &oldEip, sizeof(DWORD));
+	memcpy(Stub + 15, &pDataCopy, sizeof(DWORD));
+	memcpy(Stub + 20, &pShellcode, sizeof(DWORD));
+
+	ctx.Eip = (DWORD)pStub;
+#endif
+
+	if (!WriteProcessMemory(hProc, pStub, Stub, sizeof(Stub), nullptr)) {
+		LOG("Unload: WriteProcessMemory (Stub) failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		ResumeThread(hThread);
+		CloseHandle(hThread);
+		CloseHandle(hProc);
+		return false;
+	}
+	if (!SetThreadContext(hThread, &ctx)) {
+		LOG("Unload: SetThreadContext failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		ResumeThread(hThread);
+		CloseHandle(hThread);
+		CloseHandle(hProc);
+		return false;
+	}
+	if (ResumeThread(hThread) == (DWORD)-1) {
+		LOG("Unload: ResumeThread failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		CloseHandle(hThread);
+		CloseHandle(hProc);
+		return false;
+	}
+
+	LOG("Unload: Shellcode running on TID %d\n", dwTID);
+
+	HINSTANCE hCheck = NULL;
+	while (!hCheck) {
+		DWORD exitcode = 0;
+		GetExitCodeProcess(hProc, &exitcode);
+		if (exitcode != STILL_ACTIVE) {
+			LOG("Unload: Process exited (code %d)\n", exitcode);
+			VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+			VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+			VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+			CloseHandle(hThread);
+			CloseHandle(hProc);
+			return true;
+		}
+
+		UNLOAD_DATA dataChecked = {};
+		ReadProcessMemory(hProc, pDataCopy, &dataChecked, sizeof(dataChecked), nullptr);
+		hCheck = dataChecked.hMod;
+
+		Sleep(10);
+	}
+
+	LOG("Unload: Payload finished! Waiting for thread to safely return...\n");
+
+	CONTEXT checkCtx;
+	checkCtx.ContextFlags = CONTEXT_CONTROL;
+	while (true) {
+		if (SuspendThread(hThread) == (DWORD)-1) {
+			LOG("Unload: Target thread died during execution! Breaking loop.\n");
+			break;
+		}
+		GetThreadContext(hThread, &checkCtx);
+		ResumeThread(hThread);
+
+#ifdef _WIN64
+		bool inStub = (checkCtx.Rip >= (DWORD64)pStub && checkCtx.Rip < (DWORD64)pStub + 0x1000);
+		bool inShellcode = (checkCtx.Rip >= (DWORD64)pShellcode && checkCtx.Rip < (DWORD64)pShellcode + 0x1000);
+		if (!inStub && !inShellcode) break;
+#else
+		bool inStub = (checkCtx.Eip >= (DWORD)pStub && checkCtx.Eip < (DWORD)pStub + 0x1000);
+		bool inShellcode = (checkCtx.Eip >= (DWORD)pShellcode && checkCtx.Eip < (DWORD)pShellcode + 0x1000);
+		if (!inStub && !inShellcode) break;
+#endif
+		Sleep(1);
+	}
+
+	CloseHandle(hThread);
+	LOG("Unload: payload finished, cleaning up\n");
+
+	VirtualFreeEx(hProc, unloadData.pBase, 0, MEM_RELEASE);
+	VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+	VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+	VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+
+	CloseHandle(hProc);
+	LOG("Unload: DLL successfully unloaded\n");
+	return true;
+}
+
 #define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
 #define RELOC_FLAG64(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
 
@@ -493,11 +775,10 @@ bool ManualMapDll(HANDLE hProc, DWORD PID, BYTE* pSrcData, SIZE_T FileSize, bool
 #pragma optimize( "", off )
 void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 	if (!pData) {
-		pData->hMod = (HINSTANCE)0x404040;
 		return;
 	}
 
-	BYTE* pBase = pData->pbase;
+	BYTE* pBase = pData->pBase;
 	auto* pOpt = &reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>((uintptr_t)pBase)->e_lfanew)->OptionalHeader;
 
 	auto _LoadLibraryA = pData->pLoadLibraryA;
@@ -563,7 +844,7 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 
 #ifdef _WIN64
 
-	if (pData->SEHSupport) {
+	if (pData->bSEHSupport) {
 		auto excep = pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
 		if (excep.Size) {
 			if (!_RtlAddFunctionTable(
@@ -576,10 +857,40 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 
 #endif
 
-	_DllMain(pBase, pData->fdwReasonParam, pData->reservedParam);
+	_DllMain(pBase, pData->dwReasonParam, pData->pReservedParam);
 
 	if (ExceptionSupportFailed)
 		pData->hMod = reinterpret_cast<HINSTANCE>(0x505050);
 	else
-		pData->hMod = reinterpret_cast<HINSTANCE>(pBase);
+		pData->hMod = reinterpret_cast<HINSTANCE>(0x101010);
+}
+
+#pragma runtime_checks( "", off )
+#pragma optimize( "", off )
+void __stdcall UnloadShellcode(UNLOAD_DATA* pData) {
+	if (!pData) {
+		return;
+	}
+
+	BYTE* pBase = pData->pBase;
+
+	if (pData->dwEntryPointRVA) {
+		auto DllMain = (f_DLL_ENTRY_POINT)(pBase + pData->dwEntryPointRVA);
+		DllMain(pBase, DLL_PROCESS_DETACH, nullptr);
+	}
+
+	if (pData->dwTlsDirSize && pData->dwTlsDirVA) {
+		auto* pTLS = (IMAGE_TLS_DIRECTORY*)(pBase + pData->dwTlsDirVA);
+		auto* pCb = (PIMAGE_TLS_CALLBACK*)(pTLS->AddressOfCallBacks);
+		for (; pCb && *pCb; ++pCb)
+			(*pCb)(pBase, DLL_PROCESS_DETACH, nullptr);
+	}
+
+#ifdef _WIN64
+	if (pData->dwExceptionDirSize) {
+		pData->pRtlDeleteFunctionTable(
+			(PRUNTIME_FUNCTION)(pBase + pData->dwExceptionDirVA));
+	}
+#endif
+	pData->hMod = reinterpret_cast<HINSTANCE>(0x101010);
 }
