@@ -752,10 +752,23 @@ bool UnloadDll(DWORD PID, const UNLOAD_DATA& unloadData) {
 	CloseHandle(hThread);
 	LOG("Unload: payload finished, cleaning up\n");
 
-	VirtualFreeEx(hProc, unloadData.pBase, 0, MEM_RELEASE);
-	VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
-	VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
-	VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+	if (!VirtualFreeEx(hProc, unloadData.pBase, 0, MEM_RELEASE)) {
+		LOG("Unload: FAILED to release DLL memory! 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE);
+		CloseHandle(hProc);
+		return false;
+	}
+	if (!VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE)) {
+		LOG("Unload: WARNING: can't release shellcode memory\n");
+	}
+	if (!VirtualFreeEx(hProc, pStub, 0, MEM_RELEASE)) {
+		LOG("Unload: WARNING: can't release stub memory\n");
+	}
+	if (!VirtualFreeEx(hProc, pDataCopy, 0, MEM_RELEASE)) {
+		LOG("Unload: WARNING: can't release data memory\n");
+	}
 
 	CloseHandle(hProc);
 	LOG("Unload: DLL successfully unloaded\n");
